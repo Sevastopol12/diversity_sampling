@@ -41,7 +41,7 @@ class AugmentModel:
         self.model.eval()
 
     def _load_tokenizer(self, model_id: str) -> AutoTokenizer:
-        tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         return tokenizer
@@ -140,7 +140,7 @@ class AugmentModel:
             raise ValueError("n_candidates must be at least 1")
 
         dataset_loader = DataLoader(
-            ParaphraseDatasetObject(dataset=dataset, tokenizer=self.tokenizer),
+            ParaphraseDatasetObject(dataset=dataset),
             batch_size=1,  # IMPORTANT
             shuffle=True,
             collate_fn=self._custom_collator,
