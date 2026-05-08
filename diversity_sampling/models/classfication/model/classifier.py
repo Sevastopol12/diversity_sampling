@@ -1,22 +1,24 @@
 import torch
+import gc
 import pandas as pd
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import (
     get_linear_schedule_with_warmup,
     AutoTokenizer,
-    AutoModelForSequenceClassification,
+    DistilBertForSequenceClassification,
     BitsAndBytesConfig,
     PreTrainedTokenizer,
 )
+from peft import LoraConfig, get_peft_model
 from tqdm import tqdm
 
 from ..dataset_object import ClassificationDatasetObject
 
 
 class SentimentClassification:
-    def __init__(self, model_id: str | None = None, quantization: bool = True):
-        self.default_model_id = "unsloth/Llama-3.2-1B-Instruct"
+    def __init__(self, model_id: str | None = None, quantization: bool = False):
+        self.default_model_id = "distilbert-base-uncased-finetuned-sst-2-english"
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.clf = self._load_model(
             model_id=model_id or self.default_model_id, quantization=quantization
@@ -24,23 +26,39 @@ class SentimentClassification:
         self.tokenizer_id: str = self.clf.config._name_or_path
         self.tokenizer: PreTrainedTokenizer = self._load_tokenizer(self.tokenizer_id)
 
-    def _load_model(self, model_id: str, quantization: bool):
+    def _load_model(self, model_id: str, quantization: bool, token=None):
         print(f"Loading: {model_id}\n Device: {self.device}\n Quantize: {quantization}")
         quantization_config = (
             BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_use_double_quant=True,
-                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_compute_dtype=torch.float16,
             )
             if quantization
             else None
         )
 
-        clf = AutoModelForSequenceClassification.from_pretrained(
-            model_id, quantization_config
-        ).to(self.device)
+        lora_config = LoraConfig(
+            r=8,
+            lora_alpha=16,
+            target_modules=["q_lin", "k_lin", "v_lin", "out_lin"],
+            modules_to_save=["classifier", "pre_classifier"],
+            lora_dropout=0.05,
+            bias="none",
+            task_type="SEQ_CLS",
+        )
 
-        return clf
+        clf = DistilBertForSequenceClassification.from_pretrained(
+            model_id,
+            quantization_config=quantization_config,
+            num_labels=2,
+            problem_type="single_label_classification",
+            token=token,
+        )
+
+        model = get_peft_model(clf, peft_config=lora_config).to(self.device)
+        model.print_trainable_parameters()
+        return model
 
     def _load_tokenizer(self, tokenizer_id: str) -> PreTrainedTokenizer:
         tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
@@ -64,7 +82,7 @@ class SentimentClassification:
     def _custom_collator(
         self, batch: list[dict[str, list[int]]]
     ) -> dict[str, torch.Tensor]:
-        idx = [data["idx"] for data in batch]
+        indexes = [data["idx"] for data in batch]
         reviews = [data["reviews"] for data in batch]
         labels = [data["labels"] for data in batch]
 
@@ -73,9 +91,9 @@ class SentimentClassification:
         )
 
         return {
-            "idx": torch.tensor(idx),
             "input_ids": reviews_tokens["input_ids"],
             "attention_mask": reviews_tokens["attention_mask"],
+            "idx": torch.tensor(indexes),
             "labels": torch.tensor(labels),
         }
 
@@ -98,7 +116,7 @@ class SentimentClassification:
 
         optimizer = AdamW(self.clf.parameters(), lr=lr)
 
-        num_training_steps = num_epochs * len(transformed_train_set)
+        num_training_steps = num_epochs * len(train_set_loader)
         scheduler = get_linear_schedule_with_warmup(
             optimizer=optimizer,
             num_training_steps=num_training_steps,
@@ -107,17 +125,20 @@ class SentimentClassification:
 
         self.clf.train()
 
+        history: dict[int, float] = {epoch: 0.0 for epoch in range(num_epochs)}
+
         for epoch in range(num_epochs):
             epoch_losses = []
-            for i, batch in enumerate(tqdm(train_set_loader)):
+            for _, batch in enumerate(tqdm(train_set_loader)):
                 input_ids = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
 
-                outputs = self.clf(input_ids, attention_mask, labels)
+                outputs = self.clf(
+                    input_ids=input_ids, attention_mask=attention_mask, labels=labels
+                )
 
                 loss = outputs.loss
-                torch.nn.utils.clip_grad_norm_(self.clf.parameters(), 1.0)
 
                 loss.backward()
                 optimizer.step()
@@ -128,16 +149,23 @@ class SentimentClassification:
                 epoch_losses.append(loss.item())
 
                 # clear memory
-                del input_ids, attention_mask, labels, outputs
-                if i % 5 == 0:
-                    torch.cuda.empty_cache()
+                input_ids = input_ids.detach().cpu()
+                attention_mask = attention_mask.detach().cpu()
+                labels = labels.detach().cpu()
+
+                del input_ids, attention_mask, labels, outputs, batch
+                gc.collect()
 
             avg_loss = torch.mean(torch.tensor(epoch_losses))
             print(f"Epoch {epoch + 1} - Loss: {avg_loss:.4f}")
+            history[epoch] = avg_loss
 
-        print("Train completed")
+        torch.cuda.empty_cache()
+        print(f"Train completed, epochs: {num_epochs}")
 
-    def classify(
+        return history
+
+    def predict(
         self, test_set: pd.DataFrame, batch_size: int = 100
     ) -> dict[str, list[int]]:
 
@@ -154,10 +182,9 @@ class SentimentClassification:
             for idx, value in transformed_test_set.iterrows()
         }
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for i, batch in enumerate(tqdm(test_set_loader)):
                 indexes = batch["idx"]
-                labels = batch["labels"]
                 input_ids = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
 
@@ -165,31 +192,25 @@ class SentimentClassification:
                 logits: torch.Tensor = outputs.logits.detach().cpu()
 
                 for i, idx in enumerate(indexes):
-                    softmaxed_logits_records[idx.item()]["logits"] = torch.soft(
-                        logits[i], dim=0
+                    softmaxed_logits_records[idx.item()]["logits"] = torch.softmax(
+                        logits[i], dim=-1
                     )
-                    softmaxed_logits_records[idx.item()]["label"] = labels[i]
-
-                # Clear memory
-                del outputs, logits, indexes, labels, input_ids, attention_mask
-
-                if i % 5 == 0:
-                    torch.cuda.empty_cache()
 
         results = self.evaluate_results(softmaxed_logits_records)
         del softmaxed_logits_records
+
         return results
 
     def evaluate_results(
         self, softmaxed_logits_records: dict[int, dict[str, torch.Tensor]]
     ) -> dict[str, list[int]]:
         predictions: list[int] = [
-            torch.argmax(value["logits"]).detach().numpy()
+            torch.argmax(value["logits"]).item()
             for value in softmaxed_logits_records.values()
         ]
 
         true_labels: list[int] = [
-            value["labels"] for value in softmaxed_logits_records.values()
+            value["label"] for value in softmaxed_logits_records.values()
         ]
 
         indexes: list[int] = [idx for idx in softmaxed_logits_records.keys()]

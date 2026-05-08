@@ -9,16 +9,12 @@ from contextlib import asynccontextmanager, contextmanager
 db_url: str = os.getenv("DATABASE_URL")
 
 
+# Async
 async_engine = create_async_engine(url=db_url)
-engine = create_engine(url=db_url)
 
 AsyncSessionLocal = async_sessionmaker(
     bind=async_engine, autoflush=False, autocommit=False
 )
-
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-
-
 @asynccontextmanager
 async def get_async_connection():
     async with AsyncSessionLocal() as session:
@@ -30,6 +26,10 @@ async def get_async_connection():
             print(e)
             raise
 
+# Sync
+engine = create_engine(url=db_url)
+
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 @contextmanager
 def get_connection():

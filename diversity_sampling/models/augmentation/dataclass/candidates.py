@@ -10,7 +10,7 @@ class Candidates:
     candidate_sentences (list[tuple[str, Tensor]]):
             - str: The raw text string of the candidate sentence.
             - Tensor: The corresponding embedding.
-    label (str): The classification category or cluster ID assigned to this
+    label (int): The classification category or cluster ID assigned to this
         set of candidates.
     """
 

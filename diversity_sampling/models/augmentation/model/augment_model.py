@@ -1,17 +1,20 @@
 import logging
 import gc
+import os
 from typing import Any
 
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
+from torch.nn.functional import cosine_similarity
 from transformers import (
     AutoModelForCausalLM,
+    AutoModelForSequenceClassification,
     AutoTokenizer,
     GenerationConfig,
     BitsAndBytesConfig,
-    DataCollatorWithPadding,
 )
+from sentence_transformers import SentenceTransformer
 from transformers.tokenization_utils_base import BatchEncoding
 from tqdm import tqdm
 
@@ -25,28 +28,35 @@ logger = logging.getLogger(__name__)
 class AugmentModel:
     def __init__(
         self,
-        model_id: str | None = None,
+        model_id: str = "unsloth/Llama-3.2-1B-Instruct",
+        classification_model_id: str = "distilbert-base-uncased-finetuned-sst-2-english",
+        embedding_model_id: str = "all-MiniLM-L6-v2",
         generation_config: dict[str, Any] | None = None,
         quantization: bool = False,
     ):
-        self.default_model_id = "unsloth/Llama-3.2-1B-Instruct"
-        self.model_id = model_id or self.default_model_id
-        self.quantization = quantization
+        self.model_id = model_id
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.tokenizer = self._load_generation_tokenizer(self.model_id)
 
-        self.tokenizer = self._load_tokenizer(self.model_id)
+        self.quantization = quantization
         self.generation_config = self._generation_config(generation_config)
-        self.model = self._load_model(self.model_id)
 
+        self.model = self._load_generation_model(
+            self.model_id, token=os.getenv("HF_TOKEN")
+        )
+        self.embedding_model = self._load_embedding_model(
+            embedding_model_id=embedding_model_id
+        )
+        self.label_classifier = None
         self.model.eval()
 
-    def _load_tokenizer(self, model_id: str) -> AutoTokenizer:
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
+    def _load_generation_tokenizer(self, model_id: str, token=None) -> AutoTokenizer:
+        tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True, token=token)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         return tokenizer
 
-    def _load_model(self, model_id: str) -> AutoModelForCausalLM:
+    def _load_generation_model(self, model_id: str, token=None) -> AutoModelForCausalLM:
         logger.info("Loading model %s on %s", model_id, self.device)
 
         quantization_config = (
@@ -58,15 +68,33 @@ class AugmentModel:
         model = AutoModelForCausalLM.from_pretrained(
             pretrained_model_name_or_path=model_id,
             quantization_config=quantization_config,
+            token=token,
         ).to(self.device)
 
         return model
 
+    def _load_embedding_model(self, embedding_model_id: str, token=None):
+        return SentenceTransformer(
+            embedding_model_id,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            token=token,
+        )
+
+    def _load_label_classifier(
+        self, model_id: str, token=None
+    ) -> AutoModelForSequenceClassification:
+        logger.info("Loading label_classifier %s on %s", model_id, self.device)
+        return AutoModelForSequenceClassification.from_pretrained(
+            model_id, token=token
+        ).to(self.device)
+
     def _generation_config(self, generation_config):
         config = (
             GenerationConfig(
+                max_length=2048,
                 temperature=0.85,
-                top_p=0.92,
+                top_p=0.95,
+                num_return_sequences=5,
                 do_sample=True,
                 pad_token_id=self.tokenizer.eos_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
@@ -81,28 +109,21 @@ class AugmentModel:
     def _custom_collator(self, batch) -> dict[str, Any]:
         reviews = [data["reviews"] for data in batch]
         labels = [data["labels"] for data in batch]
-
-        original_tokens: dict[str, torch.Tensor] = self.tokenizer(
-            reviews,
-            truncation=True,
-            return_tensors="pt",
-            padding="longest",
-        )
-
         prompt_tokens = self._generate_prompt_template(seed_sentence=reviews)
 
         return {
-            "original_tokens": original_tokens,
+            "seed_sentences": reviews,
             "prompt_tokens": prompt_tokens,
             "labels": torch.tensor(labels),
         }
 
     def _generate_prompt_template(self, seed_sentence: str) -> dict[str, torch.Tensor]:
         system = (
-            "You are a helpful assisstant that creative and passionate in paraphrasing review"
+            "You are an expert linguistic stylist that paraphrase the provided text into a variation that differ fundamentally in syntax, vocabulary, and 'vibe'."
+            "Avoid simple synonym swapping; instead, reconstruct the core idea from the ground up."
             "Return only the paraphrased text, nothing else. No explanation, no confirmation, no prefix-answer"
         )
-        user = f"You will be given a sentence. Please paraphrase the sentence, use diverse-wording and sentence structure: {seed_sentence}"
+        user = f"Please paraphrase the sentence: {seed_sentence}"
 
         messages = [
             {"role": "system", "content": system},
@@ -113,12 +134,14 @@ class AugmentModel:
             messages,
             tokenize=True,
             add_generation_prompt=True,
+            max_length=1024,
+            truncation=True,
+            padding="max_length",
             return_tensors="pt",
-            padding="longest",
         )
 
         return prompt_tokens
-    
+
     def _dataset_config(self, dataset: pd.DataFrame) -> pd.DataFrame:
         assert "sentiment" in dataset.columns and "review" in dataset.columns
 
@@ -134,14 +157,13 @@ class AugmentModel:
 
         return dataset
 
-
     def augment(self, dataset: pd.DataFrame, n_candidates: int = 5) -> list[Candidates]:
         if n_candidates < 1:
             raise ValueError("n_candidates must be at least 1")
 
         dataset_loader = DataLoader(
             ParaphraseDatasetObject(dataset=dataset),
-            batch_size=1,  # IMPORTANT
+            batch_size=1,
             shuffle=True,
             collate_fn=self._custom_collator,
         )
@@ -155,20 +177,14 @@ class AugmentModel:
                     self.device
                 ),
             }
-            seed_tokens = {
-                "input_ids": batch["original_tokens"]["input_ids"].to(self.device),
-                "attention_mask": batch["original_tokens"]["attention_mask"].to(
-                    self.device
-                ),
-            }
+            seed_sentences = batch["seed_sentences"]
 
             label = batch["labels"].item()
 
-            with torch.no_grad():
-                seed_embedding = self._encode_batch(seed_tokens)
+            with torch.inference_mode():
+                seed_embedding = self._encode_batch(seed_sentences)
 
             candidates = self.generate_candidates(
-                n_candidates=n_candidates,
                 prompt_tokens=prompt_tokens,
             )
 
@@ -179,52 +195,40 @@ class AugmentModel:
                     "label": label,
                 }
             )
-            # Free memory
-            del prompt_tokens, seed_tokens, batch
-
-            if i % 5 == 0:
-                gc.collect()
-                torch.cuda.empty_cache()
+            del batch, seed_sentences, label, candidates
+            gc.collect()
 
         return self.transform(records=generation_records)
 
     def generate_candidates(
         self,
-        n_candidates: int,
         prompt_tokens: BatchEncoding | dict[str, torch.Tensor],
     ) -> list[tuple[str, torch.Tensor]]:
-        candidates: list[tuple[str, torch.Tensor]] = []
 
         prompt_length = prompt_tokens["input_ids"].shape[-1]
+        generated_texts: list[str] = []
 
         with torch.no_grad():
-            for _ in range(n_candidates):
-                generated_tokens = self.model.generate(
-                    **prompt_tokens,
-                    generation_config=self.generation_config,
-                )
+            generated_tokens = self.model.generate(
+                **prompt_tokens,
+                generation_config=self.generation_config,
+            )
 
-                generated_text = self.tokenizer.decode(
-                    generated_tokens[0, prompt_length:],
-                    skip_special_tokens=True,
-                    clean_up_tokenization_spaces=True,
-                ).strip()
+        for generated_token in generated_tokens:
+            text = self.tokenizer.decode(
+                generated_token[prompt_length:],
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=True,
+            ).strip()
 
-                candidate_tokens = {
-                    key: value.to(self.device)
-                    for key, value in self.tokenizer(
-                        generated_text,
-                        return_tensors="pt",
-                        truncation=True,
-                        padding="longest",
-                    ).items()
-                }
+            generated_texts.append(text)
 
-                candidate_embedding = self._encode_batch(candidate_tokens)
-                candidates.append((generated_text, candidate_embedding))
+        embeddings = self._encode_batch(generated_texts)
 
-            # Free memory
-            del generated_tokens, candidate_tokens
+        candidates: list[tuple[str, torch.Tensor]] = [
+            (candidate_text, candidate_embedding)
+            for candidate_text, candidate_embedding in zip(generated_texts, embeddings)
+        ]
 
         return candidates
 
@@ -241,14 +245,20 @@ class AugmentModel:
     def diversity_measurement(
         self, candidate_records: list[Candidates]
     ) -> dict[str, Any]:
+
         selected_candidates: list[str] = []
         rejected_candidates: list[str] = []
-        labels: list[Any] = []
+        labels: list[int] = []
+        # diversity weight
+        alpha = 0.5
+        # consistency weight
+        beta = 0.5
 
         for record in candidate_records:
             scores = torch.tensor(
                 [
-                    torch.cdist(
+                    1
+                    - cosine_similarity(
                         record.seed_embedding.to(torch.float32),
                         candidate_embedding.to(torch.float32),
                     )
@@ -256,22 +266,44 @@ class AugmentModel:
                 ]
             )
 
-            most_diverse_idx = torch.argmax(scores)
-            least_diverse_idx = torch.argmin(scores)
+            final_scores = []
 
-            selected_candidates.append(record.candidate_sentences[most_diverse_idx][0])
-            rejected_candidates.append(record.candidate_sentences[least_diverse_idx][0])
+            for i, (text, _) in enumerate(record.candidate_sentences):
+                diversity_score = scores[i].item()
+                consistency_score = self._check_label_consistency(text, record.label)
 
+                score = (alpha * diversity_score) + (beta * consistency_score)
+                final_scores.append(score)
+
+            final_scores = torch.tensor(final_scores)
+
+            best_idx = torch.argmax(final_scores)
+            worst_idx = torch.argmin(final_scores)
+
+            selected_candidates.append(record.candidate_sentences[best_idx][0])
+            rejected_candidates.append(record.candidate_sentences[worst_idx][0])
             labels.append(record.label)
 
         return {
-            "selected": pd.DataFrame(
-                {"review": selected_candidates, "sentiment": labels}
-            ),
-            "rejected": pd.DataFrame(
-                {"review": rejected_candidates, "sentiment": labels}
-            ),
+            "selected": selected_candidates,
+            "rejected": rejected_candidates,
+            "labels": labels,
         }
+
+    def _check_label_consistency(self, texts: str, label: int) -> float:
+        tokens = self.tokenizer(
+            texts,
+            return_tensors="pt",
+            truncation=True,
+            max_length=1024,
+            padding="max_length",
+        ).to(self.device)
+
+        with torch.inference_mode():
+            logits = self.label_classifier(**tokens).logits
+            probs = torch.softmax(logits, dim=-1)
+
+        return probs[0, label].item()
 
     def load_generative_model(self, model_id: str) -> None:
         self.model_id = model_id
@@ -279,9 +311,12 @@ class AugmentModel:
         self.model = self._load_model(model_id)
         self.model.eval()
 
-    def _encode_batch(
-        self, batch: BatchEncoding | dict[str, torch.Tensor]
-    ) -> torch.Tensor:
-        output = self.model(**batch, output_hidden_states=True)
-        embedding = output.hidden_states[-1][:, 0, :]
+    def _encode_batch(self, batch: str | list[str]) -> torch.Tensor:
+        embedding = self.embedding_model.encode(batch, convert_to_tensor=True)
         return embedding.detach().cpu()
+
+    def _clear_model(self, target_model):
+        model = target_model.to("cpu")
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()

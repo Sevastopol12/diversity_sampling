@@ -25,18 +25,18 @@ class CoreSetSelector:
         self.tokenizer_id: str = self.clf.config._name_or_path
         self.tokenizer: PreTrainedTokenizer = self._load_tokenizer(self.tokenizer_id)
 
-    def _load_model(self, model_id: str):
+    def _load_model(self, model_id: str, token=None):
         model_id = model_id or self.default_model_id
         print(f"Loading mode: {model_id}")
         clf = (
-            AutoModelForSequenceClassification.from_pretrained(model_id)
+            AutoModelForSequenceClassification.from_pretrained(model_id, token=token)
             .to(self.device)
             .to(self.device)
         )
         return clf
 
-    def _load_tokenizer(self, tokenizer_id: str) -> PreTrainedTokenizer:
-        return AutoTokenizer.from_pretrained(tokenizer_id)
+    def _load_tokenizer(self, tokenizer_id: str, token=None) -> PreTrainedTokenizer:
+        return AutoTokenizer.from_pretrained(tokenizer_id, use_fast=True, token=token)
 
     def _custom_collator(
         self, batch: list[dict[str, list[int]]]
@@ -71,7 +71,7 @@ class CoreSetSelector:
 
         return dataset
 
-    def finetune(
+    def get_finetune_logits(
         self,
         train_set: pd.DataFrame,
         batch_size: int = 10,
@@ -90,7 +90,7 @@ class CoreSetSelector:
 
         optimizer = AdamW(self.clf.parameters(), lr=lr)
 
-        num_training_steps = len(transformed_train_set) * num_epochs
+        num_training_steps = len(dataset_loader) * num_epochs
         scheduler = get_linear_schedule_with_warmup(
             optimizer=optimizer,
             num_training_steps=num_training_steps,
@@ -102,7 +102,7 @@ class CoreSetSelector:
         total_loss = 0
 
         training_dynamics_record: dict[int, Any] = {
-            idx: {"logits": [], "label": int(item["sentiment"] == "positive")}
+            idx: {"logits": [], "label": item["sentiment"]}
             for idx, item in train_set.iterrows()
         }
 
@@ -120,7 +120,7 @@ class CoreSetSelector:
                 logits: torch.Tensor = outputs.logits.detach().cpu()
 
                 for i, idx in enumerate(indexes):
-                    training_dynamics_record[idx.item()]["logits"].append(logits)
+                    training_dynamics_record[idx.item()]["logits"].append(logits[i])
 
                 loss = outputs.loss
 
@@ -163,10 +163,13 @@ class CoreSetSelector:
         confidence: list[float] = []
 
         for logits in training_dynamic.logits:
-            probs = torch.softmax(logits, dim=0)
+            probs = torch.softmax(logits, dim=-1)
             confidence.append(probs[training_dynamic.label].detach().numpy())
 
-        return np.std(confidence)
+        mean_conf = np.mean(confidence)
+        std_conf = np.std(confidence)
+
+        return std_conf * (1 - mean_conf)
 
     def evaluate_data_contribution(
         self, training_dynamics: list[TrainingDynamics]
