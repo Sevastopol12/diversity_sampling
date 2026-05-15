@@ -2,6 +2,14 @@
 
 This project implements various diversity sampling techniques for dataset selection and augmentation.
 
+## Recommended Requirements
+
+The following hardware is recommended for running the experiments:
+
+- **CPU**: AMD Ryzen 7 6800H
+- **RAM**: 8GB
+- **GPU**: NVIDIA GeForce RTX 3050 (4GB VRAM)
+
 ## Project Structure
 
 The project is organized into several modules:
